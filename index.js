@@ -54,7 +54,9 @@ client.on("message_create", async (message) => {
 
 async function handleCommand(message) {
   const body = message.body.trim();
-  const chatId = message.from;
+  // For incoming messages, 'from' is the chat (group/private).
+  // For outgoing messages (fromMe), 'to' is the chat.
+  const chatId = message.fromMe ? message.to : message.from;
 
   if (body.startsWith("/geeta")) {
     const args = body.split(" ");
