@@ -1,94 +1,133 @@
 const cron = require("node-cron");
+const config = require("../config");
 const stateService = require("./stateService");
 const geetaService = require("./geetaService");
 
+function log(msg) {
+  console.log(`[${new Date().toISOString()}] ${msg}`);
+}
+
 function initScheduler(client) {
-  // Schedule task for 5:00 AM daily in Asia/Kolkata
-  cron.schedule("0 5 * * *", () => {
-    console.log("Running daily shloka scheduler...");
+  cron.schedule(config.SCHEDULER_CRON, () => {
+    log("Running daily shloka scheduler...");
     sendDailyShloka(client);
   }, {
-    timezone: "Asia/Kolkata"
+    timezone: config.TIMEZONE,
   });
-  console.log("Daily scheduler initialized (5:00 AM IST).");
+  log(`Daily scheduler initialized (${config.SCHEDULER_CRON} ${config.TIMEZONE}).`);
+}
+
+function hasRealInsight(insight) {
+  return insight && !insight.includes("No commentary");
+}
+
+function formatShloka(shloka) {
+  const parts = [
+    `*🕉 Chapter ${shloka.chapter}, Verse ${shloka.verse}*`,
+    shloka.sanskrit,
+  ];
+  if (shloka.hindi) parts.push(`*अर्थ (Hindi):* ${shloka.hindi}`);
+  if (shloka.english) parts.push(`*Meaning (English):* ${shloka.english}`);
+  return parts.join("\n\n");
+}
+
+// Fetch a natural group of shlokas — stops when it finds a verse with real commentary
+async function fetchShlokaGroup(startChapter, startVerse) {
+  const chapters = await stateService.getChapterMeta();
+  const shlokas = [];
+  let ch = startChapter;
+  let v = startVerse;
+  const MAX_GROUP = 8;
+
+  for (let i = 0; i < MAX_GROUP; i++) {
+    const shloka = await geetaService.getShloka(ch, v);
+    if (!shloka) break;
+    shlokas.push(shloka);
+
+    if (hasRealInsight(shloka.insight)) break; // end of natural group
+
+    // advance to next verse
+    const meta = chapters.find(c => c.chapter_number === ch);
+    if (meta && v < meta.verses_count) {
+      v++;
+    } else if (ch < 18) {
+      ch++;
+      v = 1;
+    } else {
+      ch = 1;
+      v = 1;
+      break;
+    }
+  }
+
+  return shlokas;
 }
 
 async function sendDailyShloka(client) {
-  const subscribers = stateService.getSubscribers();
-  if (subscribers.length === 0) {
-    console.log("No subscribers for daily shloka.");
+  const groupId = stateService.getGroupId();
+  if (!groupId) {
+    log("No group ID set. Skipping daily send — bot has not found the group yet.");
     return;
   }
 
-  const progress = stateService.getProgress();
-  const currentChapter = progress.chapter;
-  const currentVerse = progress.verse;
+  const { chapter, verse } = stateService.getProgress();
+  log(`Fetching shloka group starting at Chapter ${chapter}, Verse ${verse}...`);
 
-  console.log(`Fetching daily shloka: Chapter ${currentChapter}, Verse ${currentVerse}`);
-  const shloka = await geetaService.getShloka(currentChapter, currentVerse);
+  const shlokas = await fetchShlokaGroup(chapter, verse);
+  if (shlokas.length === 0) {
+    log("Failed to fetch shlokas. Will try again tomorrow.");
+    return;
+  }
 
-  if (shloka) {
-    const message = `*Daily Geeta Shloka* 🌅
+  const last = shlokas[shlokas.length - 1];
+  const insight = shlokas.map(s => s.insight).find(hasRealInsight) || null;
 
-*Chapter ${shloka.chapter}, Shloka ${shloka.verse}*
+  const header = `*Bhagavad Gita — Daily Shlokas* 🙏`;
+  const bodies = shlokas.map(s => formatShloka(s));
+  const footer = insight ? `*💡 Insight (Chinmayananda):*\n${insight}` : null;
 
-${shloka.sanskrit}
+  const parts = [header, ...bodies];
+  if (footer) parts.push(footer);
+  const message = parts.join("\n\n─────────────────\n\n");
 
-*Meaning (Hindi):*
-${shloka.hindi}
-
-*Meaning (English):*
-${shloka.english}
-
-_To unsubscribe, reply with /unsubscribe_`;
-
-    for (const chatId of subscribers) {
-      try {
-        await client.sendMessage(chatId, message);
-        console.log(`Sent daily shloka to ${chatId}`);
-      } catch (error) {
-        console.error(`Failed to send to ${chatId}:`, error.message);
-      }
-    }
-
-    // Advance to next shloka
-    await advanceProgress(currentChapter, currentVerse);
-  } else {
-    console.error("Failed to fetch daily shloka. Retrying same shloka tomorrow.");
+  try {
+    await client.sendMessage(groupId, message);
+    log(`Sent ${shlokas.length} shloka(s) to group (${groupId}).`);
+    await advanceProgress(chapter, verse, shlokas.length);
+  } catch (error) {
+    log(`Failed to send message to group: ${error.message}`);
   }
 }
 
-async function advanceProgress(currentChapter, currentVerse) {
-    const chapters = await stateService.getChapterMeta();
-    
-    // Find metadata for current chapter
-    // API returns array: [{ chapter_number: 1, verses_count: 47, ... }, ...]
-    const chapterMeta = chapters.find(c => c.chapter_number === currentChapter);
+async function advanceProgress(currentChapter, currentVerse, steps = 1) {
+  const chapters = await stateService.getChapterMeta();
+  let ch = currentChapter;
+  let v = currentVerse;
 
-    if (chapterMeta) {
-        if (currentVerse < chapterMeta.verses_count) {
-             // Next verse in same chapter
-             stateService.updateProgress(currentChapter, currentVerse + 1);
-             console.log(`Progress updated to ${currentChapter}.${currentVerse + 1}`);
-        } else {
-             // Next chapter
-             // Check if there is a next chapter (total 18)
-             if (currentChapter < 18) {
-                 stateService.updateProgress(currentChapter + 1, 1);
-                 console.log(`Progress updated to ${currentChapter + 1}.1`);
-             } else {
-                 // Restart from 1.1 again
-                 stateService.updateProgress(1, 1);
-                 console.log("Completed Geeta! Restarting from 1.1");
-             }
-        }
-    } else {
-        console.error("Could not find chapter metadata. Progress not updated.");
+  for (let i = 0; i < steps; i++) {
+    const chapterMeta = chapters.find(c => c.chapter_number === ch);
+    if (!chapterMeta) {
+      log("Could not find chapter metadata. Progress not updated.");
+      return;
     }
+    if (v < chapterMeta.verses_count) {
+      v += 1;
+    } else if (ch < 18) {
+      ch += 1;
+      v = 1;
+    } else {
+      ch = 1;
+      v = 1;
+      log("Completed all 700 shlokas! Restarting from Chapter 1, Verse 1.");
+    }
+  }
+
+  stateService.updateProgress(ch, v);
+  log(`Progress → Chapter ${ch}, Verse ${v}`);
 }
 
 module.exports = {
   initScheduler,
-  sendDailyShloka, // Exported for manual trigger/testing
-  advanceProgress, // Exported for testing
+  sendDailyShloka,
+  advanceProgress,
 };

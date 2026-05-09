@@ -3,66 +3,39 @@ const path = require("path");
 const axios = require("axios");
 
 const DATA_DIR = path.join(__dirname, "../data");
-const SUBSCRIBERS_FILE = path.join(DATA_DIR, "subscribers.json");
 const PROGRESS_FILE = path.join(DATA_DIR, "progress.json");
 const CHAPTERS_FILE = path.join(DATA_DIR, "chapters.json");
+const GROUP_FILE = path.join(DATA_DIR, "group.json");
 
-// Ensure data directory exists
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR);
 }
 
-// Helper to read JSON file
+function log(msg) {
+  console.log(`[${new Date().toISOString()}] ${msg}`);
+}
+
 function readJson(file, defaultValue) {
   try {
     if (fs.existsSync(file)) {
-      const data = fs.readFileSync(file, "utf8");
-      return JSON.parse(data);
+      return JSON.parse(fs.readFileSync(file, "utf8"));
     }
   } catch (error) {
-    console.error(`Error reading ${file}:`, error.message);
+    log(`Error reading ${file}: ${error.message}`);
   }
   return defaultValue;
 }
 
-// Helper to write JSON file
 function writeJson(file, data) {
   try {
     fs.writeFileSync(file, JSON.stringify(data, null, 2));
   } catch (error) {
-    console.error(`Error writing ${file}:`, error.message);
+    log(`Error writing ${file}: ${error.message}`);
   }
 }
 
-// Subscribers Management
-function getSubscribers() {
-  return readJson(SUBSCRIBERS_FILE, []);
-}
-
-function addSubscriber(chatId) {
-  const subscribers = getSubscribers();
-  if (!subscribers.includes(chatId)) {
-    subscribers.push(chatId);
-    writeJson(SUBSCRIBERS_FILE, subscribers);
-    return true;
-  }
-  return false;
-}
-
-function removeSubscriber(chatId) {
-  let subscribers = getSubscribers();
-  const initialLength = subscribers.length;
-  subscribers = subscribers.filter((id) => id !== chatId);
-  if (subscribers.length !== initialLength) {
-    writeJson(SUBSCRIBERS_FILE, subscribers);
-    return true;
-  }
-  return false;
-}
-
-// Progress Management
+// Progress tracking
 function getProgress() {
-  // Default to Chapter 1, Verse 1 if not set
   return readJson(PROGRESS_FILE, { chapter: 1, verse: 1 });
 }
 
@@ -70,30 +43,42 @@ function updateProgress(chapter, verse) {
   writeJson(PROGRESS_FILE, { chapter, verse });
 }
 
-// Chapter Metadata (Verse Counts)
+function resetProgress() {
+  writeJson(PROGRESS_FILE, { chapter: 1, verse: 1 });
+}
+
+// Group ID persistence
+function getGroupId() {
+  const data = readJson(GROUP_FILE, null);
+  return data ? data.chatId : null;
+}
+
+function setGroupId(chatId) {
+  writeJson(GROUP_FILE, { chatId });
+}
+
+// Chapter metadata (verse counts)
 async function getChapterMeta() {
   let chapters = readJson(CHAPTERS_FILE, null);
-  
   if (!chapters) {
     try {
-      console.log("Fetching chapter metadata from API...");
-      const response = await axios.get("https://vedicscriptures.github.io/chapters");
+      log("Fetching chapter metadata from API...");
+      const response = await axios.get("https://vedicscriptures.github.io/chapters", { timeout: 10000 });
       chapters = response.data;
       writeJson(CHAPTERS_FILE, chapters);
     } catch (error) {
-       console.error("Error fetching chapter metadata:", error.message);
-       // Fallback or retry logic could go here
-       return [];
+      log(`Error fetching chapter metadata: ${error.message}`);
+      return [];
     }
   }
   return chapters;
 }
 
 module.exports = {
-  getSubscribers,
-  addSubscriber,
-  removeSubscriber,
   getProgress,
   updateProgress,
-  getChapterMeta
+  resetProgress,
+  getGroupId,
+  setGroupId,
+  getChapterMeta,
 };

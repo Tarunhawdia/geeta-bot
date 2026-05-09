@@ -1,27 +1,24 @@
 const { Client, LocalAuth } = require("whatsapp-web.js");
-const qrcode = require("qrcode-terminal");
-const express = require("express");
-const geetaService = require("./services/geetaService");
+const qrcode = require("qrcode");
+const { exec } = require("child_process");
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const config = require("./config");
 const stateService = require("./services/stateService");
 const schedulerService = require("./services/schedulerService");
+const geetaService = require("./services/geetaService");
 
-// Initialize Express app for Render
-const app = express();
-const port = process.env.PORT || 3000;
+function log(msg) {
+  console.log(`[${new Date().toISOString()}] ${msg}`);
+}
 
-app.get("/", (req, res) => {
-  res.send("Geeta Bot is running! 🚀");
-});
-
-app.listen(port, () => {
-  console.log(`Server is running on port ${port}`);
-});
-
-// Initialize the WhatsApp client
 const client = new Client({
-  authStrategy: new LocalAuth(), // Persist session
+  authStrategy: new LocalAuth(),
   puppeteer: {
     headless: true,
+    executablePath: process.env.CHROMIUM_PATH || undefined,
+    protocolTimeout: 120000,
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
@@ -30,114 +27,112 @@ const client = new Client({
       "--no-first-run",
       "--no-zygote",
       "--disable-gpu",
+      "--disable-extensions",
+      "--disable-background-networking",
+      "--disable-sync",
+      "--metrics-recording-only",
+      "--no-default-browser-check",
+      "--aggressive-cache-discard",
+      "--disable-application-cache",
     ],
   },
 });
 
-// Generate and display QR code for login
-client.on("qr", (qr) => {
-  console.log("QR RECEIVED");
-  qrcode.generate(qr, { small: true });
+let qrServer = null;
+
+client.on("qr", async (qr) => {
+  const qrFile = path.join(__dirname, "qr.png");
+  await qrcode.toFile(qrFile, qr, { width: 400 });
+
+  if (!qrServer) {
+    qrServer = http.createServer((req, res) => {
+      const img = fs.readFileSync(qrFile);
+      res.writeHead(200, { "Content-Type": "image/png" });
+      res.end(img);
+    }).listen(3000);
+  }
+
+  log("QR ready — open http://92.4.92.81:3000 in your browser and scan with WhatsApp.");
+  exec(`xdg-open "${qrFile}" 2>/dev/null || true`);
 });
 
-// Log successful client authentication
 client.on("ready", async () => {
-  console.log("Client is ready!");
-  // Initialize scheduler
+  log("WhatsApp client ready.");
+  if (qrServer) { qrServer.close(); qrServer = null; }
+  await findAndSaveGroup();
   schedulerService.initScheduler(client);
 });
 
-// Log messages received for debugging
-client.on("message", async (message) => {
-  console.log(`Message from ${message.from}: ${message.body}`);
-  await handleCommand(message);
+client.on("auth_failure", (msg) => {
+  log(`Authentication failed: ${msg}. Delete .wwebjs_auth/ and restart to re-scan QR.`);
 });
 
-// Also handle messages from the user themselves (for testing)
-client.on("message_create", async (message) => {
-  if (message.fromMe) {
-    console.log(`Message from me: ${message.body}`);
-    await handleCommand(message);
+client.on("disconnected", (reason) => {
+  log(`Client disconnected: ${reason}. Reconnecting...`);
+  client.initialize();
+});
+
+// Find the target group by name and save its chat ID
+// Skipped if group ID is already saved (only needed once on first run)
+async function findAndSaveGroup(attempt = 1) {
+  const existing = stateService.getGroupId();
+  if (existing) {
+    log(`Group ID already saved (${existing}). Skipping search.`);
+    return;
   }
-});
 
-async function handleCommand(message) {
-  const body = message.body.trim();
-  // For incoming messages, 'from' is the chat (group/private).
-  // For outgoing messages (fromMe), 'to' is the chat.
-  const chatId = message.fromMe ? message.to : message.from;
+  try {
+    log(`Searching for group "${config.TARGET_GROUP_NAME}" (attempt ${attempt})...`);
+    const chats = await client.getChats();
+    const group = chats.find(c => c.isGroup && c.name === config.TARGET_GROUP_NAME);
 
-  if (body.startsWith("/geeta")) {
-    const args = body.split(" ");
-    
-    // Check if arguments are provided
-    if (args.length < 3) {
-      await message.reply("Usage: /geeta <chapter> <shloka>\nExample: /geeta 1 1");
-      return;
+    if (group) {
+      stateService.setGroupId(group.id._serialized);
+      log(`Group found: "${config.TARGET_GROUP_NAME}" (${group.id._serialized})`);
+    } else {
+      log(`Group not found. Available groups: ${chats.filter(c => c.isGroup).map(c => `"${c.name}"`).join(", ") || "none"}`);
+      log(`Make sure the group is named exactly "${config.TARGET_GROUP_NAME}". Retrying in 30s...`);
+      setTimeout(() => findAndSaveGroup(attempt + 1), 30000);
     }
-
-    const chapter = parseInt(args[1]);
-    const shloka = parseInt(args[2]);
-
-    if (isNaN(chapter) || isNaN(shloka)) {
-       await message.reply("Please provide valid numbers for chapter and shloka.");
-       return;
-    }
-
-    try {
-      const result = await geetaService.getShloka(chapter, shloka);
-
-      if (result) {
-        const response = `*Chapter ${result.chapter}, Shloka ${result.verse}*
-
-${result.sanskrit}
-
-*Meaning (Hindi):*
-${result.hindi}
-
-*Meaning (English):*
-${result.english}`;
-        
-        await message.reply(response);
-      } else {
-        await message.reply("Shloka not found. Please check the chapter and shloka numbers.");
-      }
-    } catch (error) {
-      console.error("Error handling command:", error);
-      await message.reply("An error occurred while fetching the shloka.");
-    }
-  } else if (body === "/help") {
-      const helpMessage = `*Available Commands:*
-
-1. */geeta <chapter> <shloka>*
-   - Get a specific shloka.
-   - Example: /geeta 1 1
-   
-2. */subscribe*
-   - Subscribe to daily Geeta shloka updates (5 AM IST).
-
-3. */unsubscribe*
-   - Stop receiving daily updates.
-
-4. */help*
-   - Show this help message.`;
-      await message.reply(helpMessage);
-  } else if (body === "/subscribe") {
-      const added = stateService.addSubscriber(chatId);
-      if (added) {
-          await message.reply("You have successfully subscribed to daily Geeta shlokas! You will receive one shloka every day at 5 AM IST.");
-      } else {
-          await message.reply("You are already subscribed.");
-      }
-  } else if (body === "/unsubscribe") {
-      const removed = stateService.removeSubscriber(chatId);
-      if (removed) {
-          await message.reply("You have successfully unsubscribed from daily updates.");
-      } else {
-          await message.reply("You are not subscribed.");
-      }
+  } catch (error) {
+    log(`Error searching for group (attempt ${attempt}): ${error.message}. Retrying in 30s...`);
+    setTimeout(() => findAndSaveGroup(attempt + 1), 30000);
   }
 }
 
-// Start the client
+// Admin commands — triggered by any message you send yourself (fromMe)
+client.on("message_create", async (message) => {
+  if (!message.fromMe) return;
+
+  const body = message.body.trim();
+  if (!body.startsWith("/")) return;
+
+  if (body === "/today") {
+    const groupId = stateService.getGroupId();
+    if (!groupId) {
+      await message.reply(`Group not found yet. Make sure a group named "${config.TARGET_GROUP_NAME}" exists.`);
+      return;
+    }
+    await message.reply("Sending today's shloka to the group...");
+    await schedulerService.sendDailyShloka(client);
+    await message.reply("Done.");
+
+  } else if (body === "/progress") {
+    const { chapter, verse } = stateService.getProgress();
+    const groupId = stateService.getGroupId();
+    await message.reply(
+      `*Geeta Bot Status*\n\nNext shloka: Chapter ${chapter}, Verse ${verse}\nGroup: ${groupId ? config.TARGET_GROUP_NAME : "not found yet"}`
+    );
+
+  } else if (body === "/reset") {
+    stateService.resetProgress();
+    await message.reply("Progress reset to Chapter 1, Verse 1.");
+
+  } else if (body === "/help") {
+    await message.reply(
+      `*Geeta Bot — Admin Commands*\n\n/today — Send today's shloka to the group now\n/progress — Show current chapter & verse\n/reset — Restart from Chapter 1, Verse 1`
+    );
+  }
+});
+
 client.initialize();
